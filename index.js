@@ -36,12 +36,18 @@ function save() {
 require("dotenv").config();
 
 // ==========================
+// 🧠 Gemini AI 設定
+// ==========================
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
+
+// ==========================
 // ⚙️ チャンネル・カテゴリーID設定
 // ==========================
 const VERIFY_CHANNEL_ID = "1517692680191344690";       // 🛡️ 認証パネル
 const CONSULT_CHANNEL_ID = "1517760332255461577";      // 💬 相談窓口
 const REPORT_PANEL_CHANNEL_ID = "1524269876947189891"; // 🚨 通報パネルを設置するチャンネル
-const CONSULT_RECEIVE_CHANNEL_ID = "1517865558136066201"; // 📩 運営への通報・ログ（AI検知等）を受信するチャンネル
+const CONSULT_RECEIVE_CHANNEL_ID = "1517865558136066201"; // 📩 運営への通報・ログを受信するチャンネル
 const WELCOME_CHANNEL_ID = "1520424091792838779";      // 👋 歓迎・自己紹介・退室通知チャンネル
 
 const TICKET_CATEGORY_ID = "1520579786764845086";      // 🎫 相談チャンネルが作成されるカテゴリー
@@ -89,7 +95,6 @@ const serverHumanCounts = new Map();
 // サーバーの人（人間）の数を計算してセットする共通関数
 function updateHumanCount(guild, offset = 0) {
     if (!serverHumanCounts.has(guild.id)) {
-        // 初回のみ大元の概算（Bot含む総数）をベースに保持（正確なカウントは参加・退室のトリガーで維持されます）
         serverHumanCounts.set(guild.id, guild.memberCount);
     }
     let current = serverHumanCounts.get(guild.id) + offset;
@@ -114,15 +119,12 @@ client.on("guildMemberAdd", async member => {
 
 // 🚪 サーバー退出時
 client.on("guildMemberRemove", async member => {
-    // Botの退出ならカウントは弄らない
     if (member.user.bot) return;
 
     const welcomeChannel = client.channels.cache.get(WELCOME_CHANNEL_ID);
     if (welcomeChannel && welcomeChannel.isTextBased()) {
         try {
-            // 【対策】fetchを一切使わず、人が出たので「-1」して安全に計算
             const humanCount = updateHumanCount(member.guild, -1);
-
             await welcomeChannel.send({
                 content: `<@${member.user.id}> さんがこのサーバーから退出してしまいました... \n現在のメンバー数は ${humanCount} 人です。`
             });
@@ -134,9 +136,62 @@ client.on("guildMemberRemove", async member => {
 
 // 💬 メッセージ送信時
 client.on("messageCreate", async message => {
+    if (message.author.bot) return;
+
     // --------------------------
+    // 🧠 メンションAI応答機能（長文分割対応・完全版）
+    // --------------------------
+    if (message.mentions.has(client.user)) {
+        // Botへのメンション文字列を綺麗に除去
+        const mentionRegex = new RegExp(`<@!?${client.user.id}>`, 'g');
+        const cleanText = message.content.replace(mentionRegex, '').trim();
+
+        if (!cleanText) {
+            return message.reply("⚠️ メンションと一緒に、AIに聞きたい文章を入力してください！\n例: `@Bot名 美味しいオムライスの作り方は？`").catch(console.error);
+        }
+
+        if (!genAI) {
+            return message.reply("❌ AI設定（APIキー）が正しく完了していません。Renderの環境変数を確認してください。").catch(console.error);
+        }
+
+        try {
+            // タイピング中状態（...が動くやつ）を開始
+            await message.channel.sendTyping();
+
+            const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+            const result = await model.generateContent(cleanText);
+            const aiResponse = result.response.text();
+
+            if (!aiResponse || aiResponse.trim() === "") {
+                await message.reply("AIからの応答が空でした。もう一度試してください。");
+                return;
+            }
+
+            // Discordの2000文字上限対策（元の長文分割ロジックを100%維持）
+            if (aiResponse.length <= 2000) {
+                await message.reply(aiResponse);
+            } else {
+                const chunks = [];
+                for (let i = 0; i < aiResponse.length; i += 1900) {
+                    chunks.push(aiResponse.substring(i, i + 1900));
+                }
+                
+                // 最初のメッセージはリプライ、続きは普通のチャンネル送信
+                await message.reply(chunks[0] + "\n(続く...)");
+                for (let i = 1; i < chunks.length; i++) {
+                    const suffix = (i === chunks.length - 1) ? "" : "\n(続く...)";
+                    await message.channel.send(chunks[i] + suffix);
+                }
+            }
+
+        } catch (aiError) {
+            console.error("AI応答エラー詳細:", aiError);
+            await message.reply("❌ AIの呼び出し中にエラーが発生しました。時間を置いて再度お試しください。").catch(console.error);
+        }
+        return; // AI処理をした場合はここで終了し、BUMP検知などへ進ませない
+    }
+
     // 🚀 BUMP & UP コマンド検知機能
-    // --------------------------
     const textContent = message.content.toLowerCase().trim();
     const isTextCommand = textContent.startsWith("/bump") || textContent.startsWith("/up");
     const isSlashCommand = message.interaction && 
@@ -158,15 +213,12 @@ client.on("messageCreate", async message => {
         }
     }
 
-    if (message.author.bot || !message.guild) return;
+    if (!message.guild) return;
 
     const userId = message.author.id;
-    const content = message.content;
     const today = new Date().toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo" }).replace(/\//g, "-");
 
-    // --------------------------
     // 3日連続発言の判定処理
-    // --------------------------
     if (!sent.activityLog) sent.activityLog = {};
     if (!sent.activityLog[userId]) sent.activityLog[userId] = [];
 
@@ -200,52 +252,6 @@ client.on("messageCreate", async message => {
             } catch (error) {
                 console.error("ロール付与失敗:", error);
             }
-        }
-    }
-
-    // --------------------------
-    // 🟠 Ollama (Llama 3) AIスパム・不適切コンテンツ検知
-    // --------------------------
-    if (message.channel.id === WELCOME_CHANNEL_ID && content && content.length >= 2) {
-        try {
-            const response = await fetch("http://127.0.0.1:11434/api/generate", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    model: "llama3:8b",
-                    prompt: `Analyze the following Discord message for inappropriate content (spam, severe insults, gore, or links to explicit material). 
-If it is inappropriate, reply with ONLY the word "DANGER". 
-If it is fine, reply with ONLY the word "SAFE".
-Do not include any other words or punctuation.
-
-Message: "${content}"`,
-                    stream: false
-                })
-            });
-
-            const data = await response.json();
-            const aiResult = data.response.trim();
-
-            if (aiResult.includes("DANGER")) {
-                const receiveChannel = client.channels.cache.get(CONSULT_RECEIVE_CHANNEL_ID);
-
-                if (receiveChannel) {
-                    const embed = {
-                        title: "❌ 不適切なメッセージ アプリ",
-                        color: 0xff0000, 
-                        fields: [
-                            { name: "⚠️ 自己紹介 NG 検知", value: "\u200b" },
-                            { name: "👤 ユーザー", value: `${message.channel} (@${message.author.username})`, inline: true },
-                            { name: "🔍 検知フィルター", value: "🟠二次フィルター (AI 判定)", inline: true },
-                            { name: "📄 判定理由", value: `AI (llama-3-8b) による不適切コンテンツ判定\n\n**【検知された内容】**\n${content}` }
-                        ],
-                        footer: { text: `検知日時: ${new Date().toISOString()}` }
-                    };
-                    await receiveChannel.send({ embeds: [embed] }).catch(console.error);
-                }
-            }
-        } catch (aiError) {
-            console.error("AI判定エラー:", aiError);
         }
     }
 });
@@ -455,9 +461,7 @@ client.on("interactionCreate", async interaction => {
 
             const welcomeChannel = client.channels.cache.get(WELCOME_CHANNEL_ID);
             if (welcomeChannel && welcomeChannel.isTextBased()) {
-                // 【対策】人が新しく「入った」ので +1 して安全にメモリ上で計算
                 const humanCount = updateHumanCount(interaction.guild, 1);
-
                 const welcomeMsg = await welcomeChannel.send({ content: `<@${interaction.user.id}> さんがサーバーに参加しました！\n現在のメンバー数は ${humanCount} 人です！` });
                 await welcomeMsg.react("👍").catch(console.error);
                 
@@ -483,9 +487,7 @@ client.on("interactionCreate", async interaction => {
             const savedMessageId = welcomeMessages.get(interaction.user.id);
 
             if (welcomeChannel && welcomeChannel.isTextBased()) {
-                // 【対策】すでにメモリ上で管理している正確なカウントをそのまま取得（通信ゼロ）
                 const humanCount = updateHumanCount(welcomeChannel.guild, 0);
-
                 let edited = false;
 
                 if (savedMessageId) {
