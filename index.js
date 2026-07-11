@@ -158,7 +158,7 @@ client.on("messageCreate", async message => {
             // タイピング中状態（...が動くやつ）を開始
             await message.channel.sendTyping();
 
-            const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+            const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-8b" });
             const result = await model.generateContent(cleanText);
             const aiResponse = result.response.text();
 
