@@ -8,7 +8,7 @@ const {
 } = require('discord.js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// --- クライアント初期化 ---
+// --- クライアント初期化 (エラーの原因だった GuildModerations を完全に削除) ---
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -140,7 +140,7 @@ client.on('messageCreate', async (message) => {
         const content = message.content || '';
         const reportChannel = message.guild.channels.cache.get(REPORT_CHANNEL_ID);
 
-        // --- ★A. ユーザーからの通報・提案・質問・不具合メッセージの転送処理 ---
+        // --- A. ユーザーからの通報・提案・質問・不具合メッセージの転送処理 ---
         const prefixes = ['!通報', '!提案', '!質問', '!不具合', '!相談'];
         const matchedPrefix = prefixes.find(p => content.startsWith(p));
 
