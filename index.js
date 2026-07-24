@@ -3,12 +3,15 @@ const {
     GatewayIntentBits, 
     Partials, 
     EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
     AuditLogEvent,
     PermissionFlagsBits 
 } = require('discord.js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// --- クライアント初期化 (エラーの原因だった GuildModerations を完全に削除) ---
+// --- クライアント初期化 ---
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -29,6 +32,7 @@ if (process.env.GEMINI_API_KEY) {
 const REPORT_CHANNEL_ID = '1517865558136066201'; // 報告・通知・転送用チャンネル
 const AD_CHANNEL_ID = '1517868958768693309';     // 宣伝許可チャンネル
 const BOT_ROLE_ID = '1520422736126804150';        // Bot用初期ロール
+const VERIFIED_ROLE_ID = '1517868958768693309';   // 認証完了時に付与するロールID（適宜変更してください）
 
 // 違反記録用メモリデータ
 const userMessageHistory = new Map();
@@ -36,7 +40,7 @@ const userSpamViolations = new Map();
 const userAdViolations = new Map();
 const userInappropriateViolations = new Map();
 
-// グローバルエラーハンドラー（Botが停止するのを防止）
+// グローバルエラーハンドラー（Bot落ち防止）
 process.on('unhandledRejection', (reason) => {
     console.error('未処理のPromise拒否:', reason);
 });
@@ -45,7 +49,7 @@ process.on('uncaughtException', (err) => {
 });
 
 client.once('ready', () => {
-    console.log(`${client.user.tag} 起動完了（全機能・エラー耐性適用済み）`);
+    console.log(`${client.user.tag} 起動完了（認証・モデレーション機能動作中）`);
 });
 
 // -------------------------------------------------------------
@@ -54,6 +58,7 @@ client.once('ready', () => {
 client.on('guildMemberAdd', async (member) => {
     try {
         if (member.user.bot) {
+            // Botの場合は指定のBotロールを付与
             try {
                 await member.roles.add(BOT_ROLE_ID);
             } catch (err) {
@@ -130,7 +135,35 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 });
 
 // -------------------------------------------------------------
-// 4. メッセージ受信時の処理（通報・提案・不具合受信 & 各種モデレーション）
+// 4. ボタンインタラクション処理 (認証ボタンの処理)
+// -------------------------------------------------------------
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    if (interaction.customId === 'verify_button') {
+        try {
+            const member = interaction.member;
+            const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
+
+            if (role) {
+                if (member.roles.cache.has(role.id)) {
+                    return await interaction.reply({ content: '✅ すでに認証済みです！', ephemeral: true });
+                }
+                await member.roles.add(role);
+                await interaction.reply({ content: '🎉 認証が完了しました！サーバーをお楽しみください。', ephemeral: true });
+            } else {
+                // ロールIDが見つからない場合のフォールバックメッセージ
+                await interaction.reply({ content: '✅ 認証が完了しました！', ephemeral: true });
+            }
+        } catch (error) {
+            console.error('認証処理エラー:', error);
+            await interaction.reply({ content: '❌ 認証中にエラーが発生しました。管理者に連絡してください。', ephemeral: true }).catch(() => {});
+        }
+    }
+});
+
+// -------------------------------------------------------------
+// 5. メッセージ受信時の処理（認証パネルパネル設置 & 各種モデレーション）
 // -------------------------------------------------------------
 client.on('messageCreate', async (message) => {
     try {
@@ -139,6 +172,25 @@ client.on('messageCreate', async (message) => {
         const userId = message.author.id;
         const content = message.content || '';
         const reportChannel = message.guild.channels.cache.get(REPORT_CHANNEL_ID);
+
+        // --- ★ 認証パネル設置コマンド（管理者用: !認証パネル） ---
+        if (content === '!認証パネル' && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+            const embed = new EmbedBuilder()
+                .setTitle('🔒 サーバー認証')
+                .setDescription('下の「認証する」ボタンを押してサーバーへのアクセス権を取得してください。')
+                .setColor(0x00FF99);
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('verify_button')
+                    .setLabel('認証する')
+                    .setStyle(ButtonStyle.Success)
+            );
+
+            await message.channel.send({ embeds: [embed], components: [row] });
+            try { if (message.deletable) await message.delete(); } catch (_) {}
+            return;
+        }
 
         // --- A. ユーザーからの通報・提案・質問・不具合メッセージの転送処理 ---
         const prefixes = ['!通報', '!提案', '!質問', '!不具合', '!相談'];
@@ -166,13 +218,12 @@ client.on('messageCreate', async (message) => {
                 await reportChannel.send({ embeds: [embed] }).catch(() => {});
             }
 
-            // 元のメッセージを消去し、送信者に案内を通知
             try { if (message.deletable) await message.delete(); } catch (_) {}
             await message.channel.send(`✅ <@${userId}> さんのメッセージ（${matchedPrefix.replace('!', '')}）を管理用チャンネルに送信しました！`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
             return;
         }
 
-        // --- B. スパム検知 ---
+        // --- B. スパム検知（連投時に複数削除）---
         const userHistory = userMessageHistory.get(userId) || { text: '', count: 0 };
         if (userHistory.text === content && content.trim() !== '') {
             userHistory.count += 1;
@@ -184,13 +235,23 @@ client.on('messageCreate', async (message) => {
 
         if (userHistory.count >= 10) {
             userMessageHistory.set(userId, { text: '', count: 0 });
-            try { if (message.deletable) await message.delete(); } catch (_) {}
+
+            // 10回連投された場合、チャンネル内の直近メッセージから同じ人の連続発言をまとめて削除
+            try {
+                const fetchedMessages = await message.channel.messages.fetch({ limit: 20 });
+                const userSpamMessages = fetchedMessages.filter(m => m.author.id === userId && m.content === content);
+                await message.channel.bulkDelete(userSpamMessages).catch(() => {
+                    if (message.deletable) message.delete().catch(() => {});
+                });
+            } catch (_) {
+                if (message.deletable) await message.delete().catch(() => {});
+            }
 
             const violations = (userSpamViolations.get(userId) || 0) + 1;
             userSpamViolations.set(userId, violations);
 
             if (reportChannel) {
-                await reportChannel.send(`⚠️ **スパム検知**: <@${userId}> が同じ連投を10回行いました。`).catch(() => {});
+                await reportChannel.send(`⚠️ **スパム検知**: <@${userId}> が同じ連投を10回行いました。（自動削除済み）`).catch(() => {});
             }
 
             if (violations >= 2) {
